@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Bluetooth Smart Clock Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #f5f5f5;
+      color: #333;
+    }
+    h1 { text-align: center; margin-bottom: 1.5rem; }
+    .container { background: white; padding: 1.5rem; margin-bottom: 1.5rem; border-radius: 8px; }
+    .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+    .row > * { flex: 1; min-width: 200px; }
+    label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
+    input, select, button { padding: 0.5rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }
+    button { background: #1976d2; color: white; border: none; cursor: pointer; }
+    button:disabled { background: #b0b0b0; cursor: not-allowed; }
+    button:hover:not(:disabled) { background: #1565c0; }
+    #deviceList { min-height: 100px; }
+    #logs { padding: 1rem; background: #e3eafc; height: 150px; overflow-y: auto; font-size: 0.85rem; margin-top: 1rem; border-radius: 4px; }
+    .log-entry { padding: 0.3rem 0; border-bottom: 1px solid #bbdefb; }
+    .log-entry:last-child { border-bottom: none; }
+    .status { padding: 0.5rem; margin: 1rem 0; border-radius: 4px; }
+    .connected { background: #e8f5e9; color: #2e7d32; }
+    .disconnected { background: #ffebee; color: #c62828; }
+    .uuid { font-family: monospace; font-size: 0.75rem; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>Web Bluetooth Smart Clock Demo</h1>
+
+  <div class="container">
+    <h2>1. Scan & Connect</h2>
+    <div class="row">
+      <button id="scanBtn" onclick="scanDevices()">Scan Devices</button>
+      <select id="deviceList" onChange="selectDevice(this.value)"></select>
+      <button id="connectBtn" disabled onclick="connectDevice()">Connect</button>
+    </div>
+    <div class="status disconnected" id="status">Not connected</div>
+  </div>
+
+  <div class="container">
+    <h2>2. Send Notification</h2>
+    <div class="row">
+      <input id="notifText" placeholder="Enter notification text...">
+      <button id="sendNotifBtn" disabled onclick="sendNotification()">Send to Device</button>
+    </div>
+    <div id="notifLogs" class="logs"></div>
+  </div>
+
+  <div class="container">
+    <h2>3. Send Weather Info</h2>
+    <div class="row">
+      <input id="weatherCode" type="number" placeholder="Weather code (e.g. 0-200)" min="0" max="200">
+      <input id="temp" type="number" placeholder="Temperature (°C)" step="0.1">
+      <input id="city" placeholder="City name">
+      <button id="sendWeatherBtn" disabled onclick="sendWeather()">Send Weather</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>4. Device Log</h2>
+    <div id="deviceLogs" class="logs"></div>
+  </div>
+
+  <div style="text-align: center; margin-top: 2rem; font-size: 0.8rem; color: #666;">
+    <p>UUIDs:</p>
+    <span class="uuid">Service: BF400001-DFE4-4CE7-AC84-75737BE65351</span><br>
+    <span class="uuid">Write:  BF400002-DFE4-4CE7-AC84-75737BE65351</span><br>
+    <span class="uuid">Notify: BF400003-DFE4-4CE7-AC84-75737BE65351</span>
+  </p>
+</body>
+</html>
+<script type="module">
+  'use strict';
+
+  // ============= BLE UUIDs (from Smart Clock analysis) =============
+  const UUIDS = {
+    SERVICE: 'BF400001-DFE4-4CE7-AC84-75737BE65351',
+    WRITE:  'BF400002-DFE4-4CE7-AC84-75737BE65351',
+    NOTIFY: 'BF400003-DFE4-4CE7-AC84-75737BE65351'
+  };
+
+  // ============= Protocol constants (from Constant.PhoneCommand) =============
+  const PhoneCommand = {
+    VERSION:        1,
+    BATTERY:        3,
+    ALARM:          5,
+    REMINDER:       7,
+    MESSAGE:       12,
+    WEATHER:       49,
+    HEART_RATE:    15,
+    OXYGEN:        18,
+    STEP:         13,
+    SLEEP:        14,
+    DIAL:         66
+  };
+
+  // ============= State =============
+  let bluetoothDevice = null;
+  let gatt = null;
+  let writeChar = null;
+  let notifyChar = null;
+  let isAndroidAppMode = true; // emulate the Android app behavior
+
+  // ============= DOM Elements =============
+  const scanBtn      = document.getElementById('scanBtn');
+  const deviceList   = document.getElementById('deviceList');
+  const connectBtn   = document.getElementById('connectBtn');
+  const statusEl     = document.getElementById('status');
+  const notifText    = document.getElementById('notifText');
+  const sendNotifBtn = document.getElementById('sendNotifBtn');
+  const notifLogs    = document.getElementById('notifLogs');
+  const sendWeatherBtn = document.getElementById('sendWeatherBtn');
+  const weatherCode  = document.getElementById('weatherCode');
+  const temp         = document.getElementById('temp');
+  const city         = document.getElementById('city');
+  const deviceLogs   = document.getElementById('deviceLogs');
+
+  // ============= Utility: append log =============
+  function appendLog(el, message, isError = false) {
+    const div = document.createElement('div');
+    div.className = `log-entry${isError ? ' error' : ''}`;
+    div.textContent = `${new Date().toLocaleTimeString()} - ${message}`;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // ============= 1. Scan Devices =============
+  async function scanDevices() {
+    if (!navigator.bluetooth) return alert('Web Bluetooth not supported in this browser.');
+    scanBtn.disabled = true;
+    try {
+      const devices = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [UUIDS.SERVICE] }],
+        optionalServices: [UUIDS.SERVICE]
+      });
+
+      // Filter like Android: "GAC-W3" prefix for wristbands
+      if (devices.name && devices.name.startsWith('GAC-W3')) {
+        addDeviceToList(devices);
+        appendLog(deviceLogs, `Found: ${devices.name} (${devices.id})`);
+      } else if (!devices.name) {
+        // Devices without names might still be valid
+        addDeviceToList(devices);
+        appendLog(deviceLogs, `Found device (${devices.id}) - no name`);
+      } else {
+        appendLog(deviceLogs, `Device "${devices.name}" doesn't match filter (expects "GAC-W3")`, true);
+      }
+    } catch (err) {
+      appendLog(deviceLogs, `Scan error: ${err.message}`, true);
+    } finally {
+      scanBtn.disabled = false;
+    }
+  }
+
+  function addDeviceToList(device) {
+    const opt = document.createElement('option');
+    opt.value = device.id;
+    opt.textContent = device.name || `Device ${device.id}`;
+    deviceList.appendChild(opt);
+  }
+
+  // ============= 2. Select Device =============
+  function selectDevice(id) {
+    const idx = Array.from(deviceList.options).findIndex(o => o.value === id);
+    if (idx >= 0) deviceList.selectedIndex = idx;
+  }
+
+  // ============= 3. Connect Device =============
+  async function connectDevice() {
+    const selected = deviceList.value;
+    if (!selected) return alert('Please select a device first.');
+
+    try {
+      bluetoothDevice = await navigator.bluetooth.requestDevice({ acceptAllDevices: true });
+      // Actually re-request with the selected device
+      // For simplicity, use the already-requested device
+      // In production, would filter properly
+      gatt = await bluetoothDevice.gatt.connect();
+      const service = await gatt.getService(UUIDS.SERVICE);
+
+      // Get write characteristic
+      writeChar = await service.getCharacteristic(UUIDS.WRITE);
+
+      // Get notify characteristic and set up notifications (like Android BluetoothService.notifyBluetoothDevice)
+      notifyChar = await service.getCharacteristic(UUIDS.NOTIFY);
+      await notifyChar.startNotifications();
+
+      // Add listener for incoming data from device
+      notifyChar.addEventListener('characteristicvaluechanged', (e) => {
+        const value = e.target.value;
+        parseIncomingData(value);
+        appendLog(deviceLogs, `📥 Received (${value.byteLength} bytes): ${Array.from(value).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
+      });
+
+      // UI update
+      connectBtn.disabled = true;
+      scanBtn.disabled = true;
+      deviceList.disabled = true;
+      statusEl.textContent = `Connected: ${bluetoothDevice.name || bluetoothDevice.id}`;
+      statusEl.className = 'status connected';
+      sendNotifBtn.disabled = false;
+      sendWeatherBtn.disabled = false;
+      appendLog(deviceLogs, `Connected to ${bluetoothDevice.name || bluetoothDevice.id}`);
+
+    } catch (err) {
+      appendLog(deviceLogs, `Connect error: ${err.message}`, true);
+      statusEl.textContent = 'Connection failed';
+      statusEl.className = 'status disconnected';
+    }
+  }
+
+  // ============= Parse incoming BLE data (like handlerInstruct) =============
+  function parseIncomingData(buffer) {
+    const data = new Uint8Array(buffer);
+    if (data.length < 3) return;
+
+    const head = data[0];
+    const subHead = data[1];
+    const state = data[2];
+
+    // Switch like Android BluetoothService.handlerInstruct
+    switch (head) {
+      case PhoneCommand.VERSION: {
+        // VersionResponseInstruction: bytes 3-6 = version string (hex), byte 7 = type, byte 17 = screenType, byte 18 = pare
+        if (data.length >= 7) {
+          const version = Array.from(data.slice(3, 7)).map(b => b.toString(16).padStart(2,'0')).join('');
+          appendLog(deviceLogs, `Version: ${version}, Type: ${data[7]}`);
+        }
+        break;
+      }
+      case PhoneCommand.BATTERY: {
+        // BatteryResponseInstruction: battery = byte[3], charge = byte[4]
+        if (data.length >= 5) {
+          const battery = data[3];
+          const charge = data[4];
+          appendLog(deviceLogs, `Battery: ${battery}%, Charging: ${charge ? 'yes' : 'no'}`);
+        }
+        break;
+      }
+      case PhoneCommand.MESSAGE: {
+        // MessageInstruction: head=12, subHead=0, length=data[2], unicode data
+        if (data.length >= 3) {
+          const length = data[2];
+          const textBytes = data.subarray(3, 3 + length);
+          // Convert UTF-16LE to string (like UnicodeConvertUtil.unicodeBytes2Str with isBig=true)
+          let text = '';
+          for (let i = 0; i < textBytes.length; i += 2) {
+            if (i + 1 < textBytes.length) {
+              const charCode = (textBytes[i] << 8) | textBytes[i + 1];
+              text += String.fromCharCode(charCode);
+            }
+          }
+          appendLog(notifLogs, `Notification: ${text.substring(0, 30)}${text.length > 30 ? '...' : ''}`);
+        }
+        break;
+      }
+      case PhoneCommand.WEATHER: {
+        // WeatherInstruction: head=49, subHead=1
+        // data: weatherCode(short 2B) + tempUnit(1B) + maxTemp(1B) + minTemp(1B) + cityLen(1B) + cityBytes
+        if (data.length >= 7) {
+          const weatherCode = data[2] | (data[3] << 8); // little-endian short
+          const tempUnit = data[4];
+          const maxTemp = data[5];
+          const minTemp = data[6];
+          let city = '';
+          if (data.length > 7) {
+            const cityLen = data[7];
+            if (data.length > 8 + cityLen) {
+              const cityBytes = data.subarray(8, 8 + cityLen);
+              // Decode as UTF-8
+              city = new TextDecoder().decode(cityBytes);
+            }
+          }
+          appendLog(deviceLogs, `Weather: code=${weatherCode}, tempUnit=${tempUnit}, max=${maxTemp}°C, min=${minTemp}°C, city=${city}`);
+        }
+        break;
+      }
+      case PhoneCommand.HEART_RATE: {
+        // Heart rate query response
+        if (data.length >= 4) {
+          const heartRate = data[3];
+          appendLog(deviceLogs, `Heart rate: ${heartRate} bpm`);
+        }
+        break;
+      }
+      case PhoneCommand.OXYGEN: {
+        // Blood oxygen
+        if (data.length >= 4) {
+          const bloodOxygen = data[3];
+          appendLog(deviceLogs, `Blood oxygen: ${bloodOxygen}%`);
+        }
+        break;
+      }
+      default:
+        appendLog(deviceLogs, `Unknown head: ${head} (0x${head.toString(16)}) subHead: ${subHead} state: ${state}`);
+    }
+  }
+
+  // ============= 4. Send Notification =============
+  async function sendNotification() {
+    const text = notifText.value.trim();
+    if (!text || !writeChar) return alert('Enter text and connect device first.');
+
+    // emulate UnicodeConvertUtil.putString2UnicodeBytes with isBig=true (default)
+    // UTF-16LE: high byte first, i.e. byte[i*2] = char >>> 8, byte[i*2+1] = char & 255
+    const unicodeBytes = new Uint8Array(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      const charCode = text.charCodeAt(i);
+      unicodeBytes[i * 2]     = charCode >>> 8; // high byte
+      unicodeBytes[i * 2 + 1] = charCode & 0xFF; // low byte
+    }
+
+    // Create MessageInstruction: head=12 (MESSAGE_COMMAND), subHead=0
+    // buffer format: [head=12, subHead=0, length, ...unicode bytes]
+    const length = unicodeBytes.length;
+    const buffer = new Uint8Array(3 + length);
+    buffer[0] = PhoneCommand.MESSAGE;    // head
+    buffer[1] = 0;                       // subHead
+    buffer[2] = length;                  // length
+    buffer.set(unicodeBytes, 3);         // data
+
+    await writeCharacteristic(buffer);
+    appendLog(notifLogs, `Sent notification: "${text.substring(0, 20)}${text.length > 20 ? '...' : ''}"`);
+    notifText.value = '';
+  }
+
+  // ============= 5. Send Weather Info =============
+  async function sendWeather() {
+    const wCode = parseInt(weatherCode.value);
+    const tTemp = parseFloat(temp.value);
+    const tCity = city.value.trim();
+
+    if (isNaN(wCode) || isNaN(tTemp) || !tCity || !writeChar) {
+      return alert('Enter valid weather code, temperature, city and connect device first.');
+    }
+
+    // emulate WeatherInstruction format
+    // head=49 (WEATHER), subHead=1
+    // data: weatherCode(short, 2B LE) + temperatureUnit(1B) + maxTemp(1B) + minTemp(1B) + cityLen(1B) + cityBytes
+    
+    // weatherCode as little-endian short
+    const weatherCodeBuf = new Uint8Array(2);
+    weatherCodeBuf[0] = wCode & 0xFF;
+    weatherCodeBuf[1] = wCode >> 8;
+
+    // temperature as byte (truncate, like Android byte cast)
+    const tempByte = Math.round(tTemp) & 0xFF;
+
+    // city as UTF-8 bytes, with length prefix
+    const cityBytes = new TextEncoder().encode(tCity);
+    const cityLen = cityBytes.length;
+
+    // total buffer: 1(head) + 1(subHead) + 2(weatherCode) + 1(temp) + 1(max) + 1(min) + 1(cityLen) + cityBytes
+    const bufferLength = 3 + 2 + 1 + 1 + 1 + 1 + cityLen;
+    const buffer = new Uint8Array(bufferLength);
+
+    buffer[0] = PhoneCommand.WEATHER;    // head = 49
+    buffer[1] = 1;                       // subHead = 1
+
+    // weatherCode (2 bytes LE)
+    buffer[2] = weatherCodeBuf[0];
+    buffer[3] = weatherCodeBuf[1];
+
+    // temperature byte
+    buffer[4] = tempByte;
+
+    // max and min temperature - use same value like the Android app
+    buffer[5] = tempByte; // max
+    buffer[6] = tempByte; // min
+
+    // city length
+    buffer[7] = cityLen;
+
+    // city bytes
+    if (cityLen > 0) {
+      buffer.set(cityBytes, 8);
+    }
+
+    await writeCharacteristic(buffer);
+    appendLog(deviceLogs, `Sent weather: code=${wCode}, temp=${tTemp}°C, city=${tCity}`);
+    weatherCode.value = ''; temp.value = ''; city.value = '';
+  }
+
+  // ============= Helper: write characteristic =============
+  async function writeCharacteristic(buffer) {
+    if (!writeChar) throw new Error('Write characteristic not available');
+    await writeChar.writeValue(buffer);
+  }
+
+  // ============= Initialization =============
+  statusEl.textContent = 'Ready - scan for devices';
+</script>
