@@ -31,16 +31,67 @@
   </style>
 </head>
 <body>
+  <h1>Web Bluetooth Smart Clock Demo</h1>
 
+  <div class="container">
+    <h2>1. Scan & Connect</h2>
+    <div class="row">
+      <button id="scanBtn" onclick="scanDevices()">Scan Devices</button>
+      <select id="deviceList" onChange="selectDevice(this.value)"></select>
+      <button id="connectBtn" disabled onclick="connectDevice()">Connect</button>
+    </div>
+    <div class="status disconnected" id="status">Ready - scan for Bluetooth devices (note: some devices like AK420 may not show name until connected)</div>
+  </div>
+
+  <div class="container">
+    <h2>2. Send Notification</h2>
+    <div class="row">
+      <input id="notifText" placeholder="Enter notification text...">
+      <button id="sendNotifBtn" disabled onclick="sendNotification()">Send to Device</button>
+    </div>
+    <div id="notifLogs" class="logs"></div>
+  </div>
+
+  <div class="container">
+    <h2>3. Send Weather Info</h2>
+    <div class="row">
+      <input id="weatherCode" type="number" placeholder="Weather code (e.g. 0-200)" min="0" max="200">
+      <input id="temp" type="number" placeholder="Temperature (°C)" step="0.1">
+      <input id="city" placeholder="City name">
+      <button id="sendWeatherBtn" disabled onclick="sendWeather()">Send Weather</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>4. Device Log</h2>
+    <div id="deviceLogs" class="logs"></div>
+  </div>
+
+  <div style="text-align: center; margin-top: 2rem; font-size: 0.8rem; color: #666;">
+    <p>UUIDs (Smart Clock protocol):</p>
+    <span class="uuid">Service:      BF400001-DFE4-4CE7-AC84-75737BE65351</span><br>
+    <span class="uuid">Write:        BF400002-DFE4-4CE7-AC84-75737BE65351</span><br>
+    <span class="uuid">Notify:       BF400003-DFE4-4CE7-AC84-75737BE65351</span><br>
+    <span class="uuid" style="color: #f57c00;">File Write:   0000FD01-0000-1000-8000-00805F9B34FB (OTA)</span><br>
+    <span class="uuid" style="color: #f57c00;">File Notify:  0000FD02-0000-1000-8000-00805F9B34FB (OTA)</span><br>
+    <span class="uuid" style="color: #f57c00;">Alt Write:    BE410002-DFE4-4CE7-AC84-75737BE65351 (OTA)</span><br>
+    <span class="uuid" style="color: #f57c00;">Alt Notify:   BE410003-DFE4-4CE7-AC84-75737BE65351 (OTA)</span>
+  </p>
+</body>
 </html>
 <script type="module">
   'use strict';
 
   // ============= BLE UUIDs (from Smart Clock analysis) =============
   const UUIDS = {
-    SERVICE: 'BF400001-DFE4-4CE7-AC84-75737BE65351',
-    WRITE:  'BF400002-DFE4-4CE7-AC84-75737BE65351',
-    NOTIFY: 'BF400003-DFE4-4CE7-AC84-75737BE65351'
+    SERVICE:       'BF400001-DFE4-4CE7-AC84-75737BE65351',
+    WRITE:         'BF400002-DFE4-4CE7-AC84-75737BE65351',
+    NOTIFY:        'BF400003-DFE4-4CE7-AC84-75737BE65351',
+    // OTA/File transfer UUIDs (used when isOTA/isFile flags are true)
+    FILE_WRITE:    '0000FD01-0000-1000-8000-00805F9B34FB',
+    FILE_NOTIFY:   '0000FD02-0000-1000-8000-00805F9B34FB',
+    FILE_WRITE_1:  'BE410002-DFE4-4CE7-AC84-75737BE65351',
+    FILE_NOTIFY_1: 'BE410003-DFE4-4CE7-AC84-75737BE65351'
   };
 
   // ============= Protocol constants (from Constant.PhoneCommand) =============
@@ -98,17 +149,19 @@
         optionalServices: [UUIDS.SERVICE]
       });
 
-      // Filter like Android: "GAC-W3" prefix for wristbands
-      if (devices.name && devices.name.startsWith('GAC-W3')) {
+      // Add all devices that match the service UUID filter
+      // (Some devices like AK420 may not advertise "GAC-W3" prefix but still use the protocol)
+      if (devices.name) {
         addDeviceToList(devices);
         appendLog(deviceLogs, `Found: ${devices.name} (${devices.id})`);
-      } else if (!devices.name) {
-        // Devices without names might still be valid
+      } else if (devices.id) {
+        // Device has no visible name but matches service UUID
         addDeviceToList(devices);
-        appendLog(deviceLogs, `Found device (${devices.id}) - no name`);
-      } else {
-        appendLog(deviceLogs, `Device "${devices.name}" doesn't match filter (expects "GAC-W3")`, true);
+        appendLog(deviceLogs, `Found device (${devices.id}) - no visible name (may require connection first)`);
       }
+      // Note: Unlike the original Android app which filters for "GAC-W3" prefix,
+      // this demo shows all devices advertising the service UUID. 
+      // If your device doesn't appear, it may need to be paired/connected first.
     } catch (err) {
       appendLog(deviceLogs, `Scan error: ${err.message}`, true);
     } finally {
@@ -155,6 +208,16 @@
         parseIncomingData(value);
         appendLog(deviceLogs, `📥 Received (${value.byteLength} bytes): ${Array.from(value).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
       });
+
+      // --- TEST: Send VERSION command to verify connection ---
+      // Head=1 (VERSION), subHead=0, state=0, no data payload needed beyond header
+      const testBuffer = new Uint8Array(3);
+      testBuffer[0] = PhoneCommand.VERSION;  // head = 1
+      testBuffer[1] = 0;                     // subHead = 0
+      testBuffer[2] = 0;                     // state = 0
+      await writeCharacteristic(testBuffer);
+      appendLog(deviceLogs, '📤 Sent TEST: VERSION command (head=1) to verify BLE connection');
+      // --------------------------------
 
       // UI update
       connectBtn.disabled = true;
@@ -283,9 +346,13 @@
     buffer[2] = length;                  // length
     buffer.set(unicodeBytes, 3);         // data
 
-    await writeCharacteristic(buffer);
-    appendLog(notifLogs, `Sent notification: "${text.substring(0, 20)}${text.length > 20 ? '...' : ''}"`);
-    notifText.value = '';
+    try {
+      await writeCharacteristic(buffer);
+      appendLog(notifLogs, `Sent notification: "${text.substring(0, 20)}${text.length > 20 ? '...' : ''}"`);
+      notifText.value = '';
+    } catch (err) {
+      appendLog(deviceLogs, `❌ Notification send error: ${err.message}`, true);
+    }
   }
 
   // ============= 5. Send Weather Info =============
@@ -340,61 +407,34 @@
       buffer.set(cityBytes, 8);
     }
 
-    await writeCharacteristic(buffer);
-    appendLog(deviceLogs, `Sent weather: code=${wCode}, temp=${tTemp}°C, city=${tCity}`);
-    weatherCode.value = ''; temp.value = ''; city.value = '';
+    try {
+      await writeCharacteristic(buffer);
+      appendLog(deviceLogs, `Sent weather: code=${wCode}, temp=${tTemp}°C, city=${tCity}`);
+      weatherCode.value = ''; temp.value = ''; city.value = '';
+    } catch (err) {
+      appendLog(deviceLogs, `❌ Weather send error: ${err.message}`, true);
+    }
   }
 
   // ============= Helper: write characteristic =============
   async function writeCharacteristic(buffer) {
-    if (!writeChar) throw new Error('Write characteristic not available');
-    await writeChar.writeValue(buffer);
+    if (!writeChar) {
+      appendLog(deviceLogs, 'Error: Write characteristic not available - not connected', true);
+      return;
+    }
+    try {
+      await writeChar.writeValue(buffer);
+      // appendLog(deviceLogs, `✅ Wrote ${buffer.length} bytes: ${Array.from(buffer).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
+    } catch (err) {
+      appendLog(deviceLogs, `❌ Write error: ${err.message}`, true);
+      // Common GATT errors:
+      // - Device disconnected
+      // - Characteristic doesn't support write
+      // - MTU too small for buffer size
+      // - Permission denied (may need to reconnect)
+    }
   }
 
   // ============= Initialization =============
   statusEl.textContent = 'Ready - scan for devices';
-</script>
-
-  <h1>Web Bluetooth Smart Clock Demo</h1>
-
-  <div class="container">
-    <h2>1. Scan & Connect</h2>
-    <div class="row">
-      <button id="scanBtn" onclick="scanDevices()">Scan Devices</button>
-      <select id="deviceList" onChange="selectDevice(this.value)"></select>
-      <button id="connectBtn" disabled onclick="connectDevice()">Connect</button>
-    </div>
-    <div class="status disconnected" id="status">Not connected</div>
-  </div>
-
-  <div class="container">
-    <h2>2. Send Notification</h2>
-    <div class="row">
-      <input id="notifText" placeholder="Enter notification text...">
-      <button id="sendNotifBtn" disabled onclick="sendNotification()">Send to Device</button>
-    </div>
-    <div id="notifLogs" class="logs"></div>
-  </div>
-
-  <div class="container">
-    <h2>3. Send Weather Info</h2>
-    <div class="row">
-      <input id="weatherCode" type="number" placeholder="Weather code (e.g. 0-200)" min="0" max="200">
-      <input id="temp" type="number" placeholder="Temperature (°C)" step="0.1">
-      <input id="city" placeholder="City name">
-      <button id="sendWeatherBtn" disabled onclick="sendWeather()">Send Weather</button>
-    </div>
-  </div>
-
-  <div class="container">
-    <h2>4. Device Log</h2>
-    <div id="deviceLogs" class="logs"></div>
-  </div>
-
-  <div style="text-align: center; margin-top: 2rem; font-size: 0.8rem; color: #666;">
-    <p>UUIDs:</p>
-    <span class="uuid">Service: BF400001-DFE4-4CE7-AC84-75737BE65351</span><br>
-    <span class="uuid">Write:  BF400002-DFE4-4CE7-AC84-75737BE65351</span><br>
-    <span class="uuid">Notify: BF400003-DFE4-4CE7-AC84-75737BE65351</span>
-  </p>
-      </body>
+  </script>
